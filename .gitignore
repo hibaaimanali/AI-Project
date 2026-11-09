@@ -1,0 +1,16 @@
+# Local Python environment and cache files
+.venv/
+__pycache__/
+*.py[cod]
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+pytorch_model*.bin
+
+# Competition data
+/enveda-CASMI26-molecule-id-mass-spectra.zip
+*.parquet
+*.arrow
