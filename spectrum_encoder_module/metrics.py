@@ -3,6 +3,9 @@
 import numpy as np
 
 
+THRESHOLDS = (0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7)
+
+
 def fingerprint_metrics(predicted, target):
     predicted = np.atleast_2d(predicted).astype(bool)
     target = np.atleast_2d(target).astype(bool)

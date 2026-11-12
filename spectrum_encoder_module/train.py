@@ -16,11 +16,8 @@ from .data import (
     ARTIFACTS, DEFAULT_DATA, CATEGORY_COLUMNS, collect_molecules, feature_batch,
     preprocessing, spectrum_features, split_molecules,
 )
-from .metrics import fingerprint_metrics
+from .metrics import THRESHOLDS, fingerprint_metrics
 from .model import SpectrumEncoder
-
-
-THRESHOLDS = (0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7)
 
 
 def collate(examples):

@@ -1,8 +1,10 @@
 import argparse
 from collections import Counter
+from itertools import batched
 from pathlib import Path
 import sys
 
+import numpy as np
 import torch
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
@@ -65,6 +67,12 @@ class MSGPTDecoder:
         model.load_state_dict(normalize_mlm_checkpoint_state_dict(weights))
         del weights
         self.model = model.to(device).eval()
+        self.generate_tokens = self.model.generate
+
+    def enable_cached_generation(self, backend):
+        from .cached_generation import CachedGeneration
+
+        self.generate_tokens = CachedGeneration(self.model, backend)
 
     def supports_formula(self, formula):
         counts = self.formula_counts(formula) if formula else None
@@ -72,18 +80,27 @@ class MSGPTDecoder:
 
     @torch.inference_mode()
     def generate(self, fingerprint, formula, samples):
+        return self.generate_batch(torch.as_tensor(fingerprint).unsqueeze(0), [formula], samples)[0]
+
+    @torch.inference_mode()
+    def generate_batch(self, fingerprints, formulas, samples):
+        """Sample each fingerprint/formula pair and rank its candidates independently."""
         if samples < 1:
             raise ValueError("samples must be positive")
-        if not self.supports_formula(formula):
-            raise ValueError(f"The model does not support this molecular formula: {formula}")
-        fp_tensor = torch.as_tensor(fingerprint, dtype=torch.float32, device=self.device)
-        if fp_tensor.shape != (FP_BITS,) or not ((fp_tensor == 0) | (fp_tensor == 1)).all():
-            raise ValueError(f"Expected one binary {FP_BITS}-bit fingerprint")
-        formula_tensor = torch.as_tensor(self.formula_str_to_vec(formula), device=self.device).unsqueeze(0)
+        for formula in formulas:
+            if not self.supports_formula(formula):
+                raise ValueError(f"The model does not support this molecular formula: {formula}")
+        fp_tensor = torch.as_tensor(fingerprints, dtype=torch.float32, device=self.device)
+        if (not formulas or fp_tensor.shape != (len(formulas), FP_BITS)
+                or not ((fp_tensor == 0) | (fp_tensor == 1)).all()):
+            raise ValueError(f"Expected one binary {FP_BITS}-bit fingerprint per formula")
+        formula_tensor = torch.as_tensor(
+            np.stack([self.formula_str_to_vec(formula) for formula in formulas]), device=self.device,
+        )
 
         with torch.autocast("cuda", dtype=torch.float16, enabled=self.device == "cuda"):
-            token_batches = self.model.generate(
-                fingerprint=fp_tensor.unsqueeze(0),
+            token_batches = self.generate_tokens(
+                fingerprint=fp_tensor,
                 formula_vec=formula_tensor,
                 max_len=self.max_len,
                 bos_token_id=self.tokenizer.bos_token_id,
@@ -91,6 +108,12 @@ class MSGPTDecoder:
                 num_samples=samples,
             ).cpu().tolist()
 
+        return [
+            self._rank_samples(token_ids, formula)
+            for token_ids, formula in zip(batched(token_batches, samples, strict=True), formulas, strict=True)
+        ]
+
+    def _rank_samples(self, token_batches, formula):
         frequencies = Counter()
         candidates = {}
         for token_ids in token_batches:

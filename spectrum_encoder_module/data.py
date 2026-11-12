@@ -127,9 +127,11 @@ def fingerprint_array(bit_vector):
     return result
 
 
-def collect_molecules(path, *, max_rows, max_molecules, spectra_per_molecule, max_peaks, seed):
+def collect_molecules(path, *, max_rows, max_molecules, spectra_per_molecule, max_peaks, seed,
+                      extra_columns=()):
     rows = defaultdict(list)
-    for position, row in parquet_rows(path, SPECTRUM_COLUMNS + LABEL_COLUMNS, max_rows=max_rows):
+    columns = SPECTRUM_COLUMNS + LABEL_COLUMNS + extra_columns
+    for position, row in parquet_rows(path, columns, max_rows=max_rows):
         key, smiles = (row[name] for name in LABEL_COLUMNS)
         if key and smiles:
             rows[key].append((position, row))

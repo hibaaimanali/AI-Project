@@ -1,7 +1,8 @@
-"""Compare MS-GPT decoding from predicted and oracle fingerprints on held-out CASMI molecules."""
+"""Evaluate pretrained MIST fingerprints and MS-GPT decoding on labeled CASMI spectra."""
 
 import argparse
-from collections import defaultdict
+from collections import Counter
+from itertools import batched
 import json
 from pathlib import Path
 import random
@@ -9,29 +10,36 @@ import random
 import numpy as np
 import torch
 
-from SMILES_decoder_module.fingerprint import MORGAN, achiral_molecule
 from SMILES_decoder_module.generate import MSGPTDecoder, resolve_device
 
-from . import CHECKPOINT_VERSION
-from .data import (
-    ARTIFACTS, FORMULA_COLUMN, LABEL_COLUMNS, SPECTRUM_COLUMNS, feature_batch,
-    parquet_rows, spectrum_features,
-)
-from .metrics import fingerprint_metrics
-from .model import SpectrumEncoder
+from .data import ARTIFACTS, DEFAULT_DATA, FORMULA_COLUMN, collect_molecules, split_molecules
+from .metrics import THRESHOLDS, fingerprint_metrics
 
 
-def load_heldout(path, saved):
-    positions = defaultdict(set)
-    expected = {}
-    for key, (group, offset) in saved.items():
-        positions[group].add(offset)
-        expected[group, offset] = key
-    columns = SPECTRUM_COLUMNS + LABEL_COLUMNS + (FORMULA_COLUMN,)
-    rows = dict(parquet_rows(path, columns, positions=positions))
-    if rows.keys() != expected.keys() or any(rows[pos]["inchikey14"] != key for pos, key in expected.items()):
-        raise ValueError("Hold-out rows do not match. Use the same train.parquet used for training.")
-    return list(rows.items())
+MIST_FILENAME = "mist_msg_noaug.ckpt"
+
+
+def predict_split(encoder, spectra, keys, batch_size):
+    from .mist_encoder import spectrum_to_mist
+
+    skipped = Counter()
+    records = []
+    for batch in batched(keys, batch_size):
+        features, accepted = [], []
+        for key in batch:
+            position, row, _, target = spectra[key][0]
+            feature, reason = spectrum_to_mist(row)
+            if reason:
+                skipped[reason] += 1
+                continue
+            features.append(feature)
+            accepted.append((position, row, target))
+        if features:
+            records.extend(
+                (*record, probability)
+                for record, probability in zip(accepted, encoder.predict(features), strict=True)
+            )
+    return records, dict(skipped)
 
 
 def score_candidates(candidates, key, formula):
@@ -45,40 +53,59 @@ def score_candidates(candidates, key, formula):
 
 
 def evaluate(args):
+    from .mist_encoder import MistEncoder
+
     device = resolve_device(args.device)
     torch.set_num_threads(args.threads)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if checkpoint["version"] != CHECKPOINT_VERSION:
-        raise ValueError(f"Unsupported encoder checkpoint version {checkpoint['version']}")
-    if args.data is None:
-        args.data = Path(checkpoint["training"]["data"])
-    heldout = load_heldout(args.data, checkpoint["test_spectra"])
-    model = SpectrumEncoder(**checkpoint["model"]).to(device)
-    model.load_state_dict(checkpoint["state_dict"])
-    model.eval()
+    spectra, fingerprints = collect_molecules(
+        args.data, max_rows=args.max_rows, max_molecules=args.max_molecules,
+        spectra_per_molecule=3, max_peaks=32, seed=args.seed,
+        extra_columns=(FORMULA_COLUMN, "instrument_type"),
+    )
+    # Use the same structure-grouped partition as the original CASMI smoke run.
+    split, group_count, _ = split_molecules(fingerprints, 0.65, 0.15, 0.15, args.seed)
+    print(f"Loaded {len(spectra)} molecules in {group_count} structural groups. Loading MIST on {device}.",
+          flush=True)
+    encoder = MistEncoder(args.checkpoint, device)
+    validation, validation_skips = predict_split(encoder, spectra, split["validation"], args.batch_size)
+    if not validation:
+        raise ValueError(f"No validation spectra were usable by MIST: {validation_skips}")
+    validation_targets = np.stack([record[2] for record in validation])
+    validation_probabilities = np.stack([record[3] for record in validation])
+    sweep = [
+        {"threshold": threshold, **fingerprint_metrics(validation_probabilities >= threshold, validation_targets)}
+        for threshold in THRESHOLDS
+    ]
+    threshold = max(sweep, key=lambda row: (row["tanimoto"], row["threshold"]))["threshold"]
+    print(f"Selected threshold {threshold:g} on {len(validation)} validation molecules.", flush=True)
+    test, test_skips = predict_split(encoder, spectra, split["test"], args.batch_size)
+    if not test:
+        raise ValueError(f"No test spectra were usable by MIST: {test_skips}")
+    test_metrics = fingerprint_metrics(
+        np.stack([record[3] >= threshold for record in test]), np.stack([record[2] for record in test]),
+    )
+    parameter_count = encoder.parameter_count
+    del encoder
+    print(f"Scored fingerprints for {len(test)}/{len(split['test'])} test molecules "
+          f"(mean Tanimoto {test_metrics['tanimoto']:.3f}).", flush=True)
 
     print(f"Loading the existing MS-GPT decoder on {device}.", flush=True)
     decoder = MSGPTDecoder(device)
-    eligible = [(pos, row) for pos, row in heldout if decoder.supports_formula(row[FORMULA_COLUMN])]
+    eligible = [record for record in test if decoder.supports_formula(record[1][FORMULA_COLUMN])]
     if not eligible:
         raise ValueError("No held-out spectra have an MS-GPT-compatible provided formula")
     random.Random(args.seed).shuffle(eligible)
-    selected = eligible if args.molecules is None else eligible[:args.molecules]
-    threshold = checkpoint["threshold"]
+    selected = eligible[:args.molecules] if args.molecules else eligible
     results, predicted_bits, true_bits = [], [], []
-    for index, (position, row) in enumerate(selected, start=1):
+    for index, (position, row, oracle, probabilities) in enumerate(selected, start=1):
         key = row["inchikey14"]
         formula = row[FORMULA_COLUMN]
-        features = spectrum_features(row, checkpoint["preprocessing"])
-        with torch.inference_mode():
-            logits = model(*(value.to(device) for value in feature_batch([features])))
-            predicted = (logits.sigmoid().squeeze(0) >= threshold).cpu().numpy()
+        predicted = probabilities >= threshold
 
         pair_seed = args.seed + index - 1
         torch.manual_seed(pair_seed)
         predicted_candidates = decoder.generate(predicted, formula, args.samples)
 
-        oracle = MORGAN.GetFingerprintAsNumPy(achiral_molecule(row["normalized_smiles"]))
         torch.manual_seed(pair_seed)
         oracle_candidates = decoder.generate(oracle, formula, args.samples)
         predicted_bits.append(predicted)
@@ -96,8 +123,13 @@ def evaluate(args):
               f"oracle recovered {result['oracle']['recovered']}", flush=True)
 
     summary = {
-        "evaluated_molecules": len(results), "test_molecules": len(heldout),
-        "unsupported_or_missing_formulas": len(heldout) - len(eligible),
+        "encoder": "MIST", "checkpoint": str(args.checkpoint.resolve()), "parameters": parameter_count,
+        "seed": args.seed, "max_rows": args.max_rows, "max_molecules": args.max_molecules,
+        "validation_molecules": len(split["validation"]), "validation_encoded": len(validation),
+        "validation_skips": validation_skips, "validation_threshold_sweep": sweep,
+        "test_molecules": len(split["test"]), "test_encoded": len(test), "test_skips": test_skips,
+        "test_fingerprint": test_metrics, "evaluated_molecules": len(results),
+        "decoder_unsupported_formulas": len(test) - len(eligible),
         "samples_per_molecule_per_arm": args.samples, "threshold": threshold,
         "fingerprint": fingerprint_metrics(np.stack(predicted_bits), np.stack(true_bits)),
     }
@@ -109,25 +141,30 @@ def evaluate(args):
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({"summary": summary, "molecules": results}, indent=2) + "\n",
                            encoding="utf-8")
-    print(json.dumps(summary, indent=2))
     print(f"Saved candidate SMILES to {args.output}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, help="Same train.parquet used to train (default: saved data path)")
-    parser.add_argument("--checkpoint", type=Path, default=ARTIFACTS / "encoder.pt")
-    parser.add_argument("--output", type=Path, default=ARTIFACTS / "candidates.json")
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA, help="Extracted CASMI train.parquet")
+    parser.add_argument("--checkpoint", type=Path, help=f"Path to {MIST_FILENAME} (artifacts or project root)")
+    parser.add_argument("--output", type=Path, default=ARTIFACTS / "mist_smoke_candidates.json")
+    parser.add_argument("--max-rows", type=int, default=8192, help="Maximum Parquet rows scanned from the start")
+    parser.add_argument("--max-molecules", type=int, default=512, help="Maximum molecules used for partitioning")
+    parser.add_argument("--batch-size", type=int, default=8, help="MIST inference batch size")
     parser.add_argument("--molecules", type=int, default=4, help="Number of eligible test molecules, 0 for all")
     parser.add_argument("--samples", type=int, default=4, help="Generation attempts per molecule in each arm")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--threads", type=int, default=4)
     args = parser.parse_args()
-    if args.molecules < 0 or args.samples < 1 or args.threads < 1:
-        parser.error("--molecules must be nonnegative, and --samples and --threads must be positive")
-    if args.molecules == 0:
-        args.molecules = None
+    if args.molecules < 0 or min(args.samples, args.threads, args.batch_size, args.max_rows,
+                                args.max_molecules) < 1:
+        parser.error("--molecules must be nonnegative. The other limits must be positive.")
+    if args.checkpoint is None:
+        args.checkpoint = ARTIFACTS / MIST_FILENAME
+        if not args.checkpoint.is_file():
+            args.checkpoint = ARTIFACTS.parent.parent / MIST_FILENAME
     try:
         evaluate(args)
     except (ValueError, FileNotFoundError) as error:
