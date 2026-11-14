@@ -14,3 +14,4 @@ pytorch_model*.bin
 /enveda-CASMI26-molecule-id-mass-spectra.zip
 *.parquet
 *.arrow
+Data_AI_Proj.zip

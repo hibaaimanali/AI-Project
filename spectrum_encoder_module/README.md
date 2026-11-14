@@ -1,6 +1,6 @@
 # CASMI spectrum encoder
 
-The default evaluation pipeline uses the pretrained Coley Group MIST MassSpecGym encoder. MIST predicts 4,096 radius-2 Morgan fingerprint probabilities from an MS/MS spectrum and its provided CASMI molecular formula. The existing MS-GPT decoder receives the thresholded fingerprint and the same formula. The evaluation also decodes from the reference structure's fingerprint for comparison.
+The spectrum encoder evaluation uses the pretrained Coley Group MIST MassSpecGym encoder. MIST predicts 4,096 radius-2 Morgan fingerprint probabilities from an MS/MS spectrum and its provided CASMI molecular formula. MS-GPT decodes from the thresholded fingerprint and the supplied formula. The separate notebook evaluation uses reference fingerprints directly.
 
 ## Set up MIST
 
@@ -33,3 +33,15 @@ The adapter filters peaks above precursor m/z + 1, square-root scales base-peak-
 The run writes `spectrum_encoder_module/artifacts/mist_smoke_candidates.json` with encoder coverage, threshold sweep, test fingerprint metrics, and ranked decoder candidates. The test partition is held out from CASMI threshold calibration. Compound overlap with MassSpecGym pretraining has not been checked.
 
 The earlier peak-transformer training entry point remains available as `python -m spectrum_encoder_module.train` for baseline experiments. The evaluation entry point now takes a released MIST checkpoint.
+
+## Oracle fingerprint notebook evaluation
+
+`Pipeline.ipynb` evaluates the first 0.1% of labeled rows, rounded down. It derives Morgan fingerprints from the reference SMILES and passes them to MS-GPT with the supplied formulas. The oracle run requires the CASMI data and MS-GPT assets. It does not load MIST or read spectrum peaks.
+
+SQLite stores a single candidate pool per exact fingerprint and formula pair, so rows with identical inputs share the same draws. Each stage resumes from its last committed batch. `DECODER_BATCH_SIZE` controls the number of unique inputs in one CUDA graph batch. Changing the batch size changes which draws each input receives.
+
+The decoder replays CUDA graphs with a shared key/value cache. It starts by attending to a 32-token prefix of the cache and grows that prefix as needed, up to the model's original sequence limit. It also reuses the projected fingerprint and formula context across samples and tokens.
+
+For staged runs with many samples per input, `ranking_workers` overlaps CPU chemistry normalization with GPU generation. It dispatches each distinct SAFE string once per batch and counts all its occurrences when ranking. Run from a Python script with the call under `if __name__ == "__main__":` when using workers. The default of zero runs normalization in the calling process.
+
+For a two-arm MIST and oracle comparison, call `run_pipeline` with the MIST checkpoint and `staged=True`. Pass `encode_only=True` to stage the inputs and count unique pairs, then rerun with `encode_only=False` to decode and score.

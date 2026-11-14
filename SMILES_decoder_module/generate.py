@@ -1,5 +1,6 @@
 import argparse
 from collections import Counter
+from functools import lru_cache
 from itertools import batched
 from pathlib import Path
 import sys
@@ -28,6 +29,70 @@ def resolve_device(device):
     return device
 
 
+def _add_upstream_path():
+    source = str(HERE / ".upstream" / "src")
+    if source not in sys.path:
+        sys.path.insert(0, source)
+
+
+@lru_cache(maxsize=8192)
+def supports_formula(formula):
+    """Check MS-GPT's formula vocabulary without loading the checkpoint."""
+    _add_upstream_path()
+    from ms_gpt.data.mlm_pretraining_dataset import ELEMENTS
+    from ms_gpt.utils.mol_repair import formula_counts
+
+    counts = formula_counts(formula) if formula else None
+    return bool(counts) and counts.keys() <= set(ELEMENTS)
+
+
+def _sample_sequence(tokenizer, token_ids):
+    eos = tokenizer.eos_token_id
+    if eos in token_ids:
+        return tokenizer.decode(token_ids[:token_ids.index(eos)], skip_special_tokens=True)
+    return ""
+
+
+def _normalize_candidate(decode_safe, molecule_data, sequence):
+    smiles = decode_safe(sequence) if sequence else None
+    candidate = molecule_data(smiles) if smiles else None
+    if candidate is not None:
+        return {field: candidate[field] for field in ("key", "formula", "smiles")}
+    return None
+
+
+def rank_candidates(normalized, formula):
+    frequencies = Counter()
+    candidates = {}
+    for candidate in normalized:
+        if candidate is None:
+            continue
+        key = candidate["key"]
+        frequencies[key] += 1
+        if key not in candidates or candidate["formula"] == formula:
+            candidates[key] = candidate
+
+    ranked = sorted(candidates, key=lambda key: (candidates[key]["formula"] != formula, -frequencies[key], key))
+    return [dict(candidates[key], count=frequencies[key]) for key in ranked]
+
+
+@lru_cache(maxsize=1)
+def _worker_assets():
+    _add_upstream_path()
+    from ms_gpt.pipeline.postprocessing import decode_safe
+    from ms_gpt.utils.mol_repair import molecule_data
+
+    return decode_safe, molecule_data
+
+
+def normalize_sample(sequence):
+    """Decode and normalize one SAFE string without loading the model."""
+    from rdkit import rdBase
+
+    with rdBase.BlockLogs():
+        return _normalize_candidate(*_worker_assets(), sequence)
+
+
 class MSGPTDecoder:
     """Load the existing MS-GPT assets once and decode binary fingerprints."""
 
@@ -40,20 +105,17 @@ class MSGPTDecoder:
             if not required.exists():
                 raise FileNotFoundError(f"Missing {required}. See SMILES_decoder_module/README.md.")
 
-        if str(source) not in sys.path:
-            sys.path.insert(0, str(source))
+        _add_upstream_path()
         import yaml
-        from ms_gpt.data.mlm_pretraining_dataset import ELEMENTS, formula_str_to_vec, load_molecule_tokenizer
+        from ms_gpt.data.mlm_pretraining_dataset import formula_str_to_vec, load_molecule_tokenizer
         from ms_gpt.models.conditional_mlm import (
             ConditionalMoleculeLanguageModel,
             normalize_mlm_checkpoint_state_dict,
         )
         from ms_gpt.pipeline.postprocessing import decode_safe
-        from ms_gpt.utils.mol_repair import formula_counts, molecule_data
+        from ms_gpt.utils.mol_repair import molecule_data
 
         self.device = device
-        self.formula_counts = formula_counts
-        self.elements = set(ELEMENTS)
         self.formula_str_to_vec = formula_str_to_vec
         self.decode_safe = decode_safe
         self.molecule_data = molecule_data
@@ -69,14 +131,18 @@ class MSGPTDecoder:
         self.model = model.to(device).eval()
         self.generate_tokens = self.model.generate
 
-    def enable_cached_generation(self, backend):
+    def enable_cached_generation(self, backend, *, cuda_graph=False, graph_batch_size=None, prefix_attention=False):
         from .cached_generation import CachedGeneration
 
-        self.generate_tokens = CachedGeneration(self.model, backend)
+        if cuda_graph and self.device != "cuda":
+            raise ValueError("CUDA graph decoding requires a CUDA device.")
+        self.generate_tokens = CachedGeneration(
+            self.model, backend, cuda_graph=cuda_graph, graph_batch_size=graph_batch_size,
+            prefix_attention=prefix_attention,
+        )
 
     def supports_formula(self, formula):
-        counts = self.formula_counts(formula) if formula else None
-        return bool(counts) and counts.keys() <= self.elements
+        return supports_formula(formula)
 
     @torch.inference_mode()
     def generate(self, fingerprint, formula, samples):
@@ -85,6 +151,12 @@ class MSGPTDecoder:
     @torch.inference_mode()
     def generate_batch(self, fingerprints, formulas, samples):
         """Sample each fingerprint/formula pair and rank its candidates independently."""
+        token_groups = self.sample_batch(fingerprints, formulas, samples)
+        return [self._rank_samples(tokens, formula) for tokens, formula in zip(token_groups, formulas, strict=True)]
+
+    @torch.inference_mode()
+    def sample_batch(self, fingerprints, formulas, samples):
+        """Return sampled token IDs grouped by input for independent CPU ranking."""
         if samples < 1:
             raise ValueError("samples must be positive")
         for formula in formulas:
@@ -108,30 +180,17 @@ class MSGPTDecoder:
                 num_samples=samples,
             ).cpu().tolist()
 
-        return [
-            self._rank_samples(token_ids, formula)
-            for token_ids, formula in zip(batched(token_batches, samples, strict=True), formulas, strict=True)
-        ]
+        return list(batched(token_batches, samples, strict=True))
 
     def _rank_samples(self, token_batches, formula):
-        frequencies = Counter()
-        candidates = {}
-        for token_ids in token_batches:
-            if self.tokenizer.eos_token_id not in token_ids:
-                continue
-            tokens = token_ids[:token_ids.index(self.tokenizer.eos_token_id)]
-            sequence = self.tokenizer.decode(tokens, skip_special_tokens=True)
-            smiles = self.decode_safe(sequence) if sequence else None
-            candidate = self.molecule_data(smiles) if smiles else None
-            if candidate is None:
-                continue
-            key = candidate["key"]
-            frequencies[key] += 1
-            if key not in candidates or candidate["formula"] == formula:
-                candidates[key] = {field: candidate[field] for field in ("key", "formula", "smiles")}
+        return rank_candidates(
+            (_normalize_candidate(self.decode_safe, self.molecule_data, sequence)
+             for sequence in self.sample_sequences(token_batches)),
+            formula,
+        )
 
-        ranked = sorted(candidates, key=lambda key: (candidates[key]["formula"] != formula, -frequencies[key], key))
-        return [dict(candidates[key], count=frequencies[key]) for key in ranked]
+    def sample_sequences(self, token_batches):
+        return [_sample_sequence(self.tokenizer, ids) for ids in token_batches]
 
 
 def main():
